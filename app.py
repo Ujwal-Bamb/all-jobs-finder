@@ -1,180 +1,176 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import requests
 import re
-from difflib import get_close_matches
-from math import radians, cos, sin, asin, sqrt
+from io import StringIO
+from geopy.distance import geodesic
+
+# -------------------------------------------------
+# APP SETTINGS
+# -------------------------------------------------
+st.set_page_config(page_title="USA Job Finder", layout="wide")
+
+st.title("🇺🇸 USA Job Finder")
+st.write("Search caregiver jobs by ZIP code or City. Distance shown in **miles**.")
+
+# -------------------------------------------------
+# RAW CSV URLs
+# -------------------------------------------------
+CITY_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
+JOB_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
+
+ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 
 
-# -----------------------------
-# CONSTANTS
-# -----------------------------
-
-ZIP_RE = re.compile(r"\b\d{5}\b")  # strict ZIP extractor
-
-
-# -----------------------------
-# DISTANCE FUNCTION
-# -----------------------------
-
-def haversine(lat1, lon1, lat2, lon2):
-    """Calculate distance between two lat/lng points (km)."""
-    R = 6371  # Earth radius in km
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    return 2 * R * asin(sqrt(a))
+# -------------------------------------------------
+# SAFE CSV READER
+# -------------------------------------------------
+def load_csv(url):
+    try:
+        text = requests.get(url).text
+        return pd.read_csv(StringIO(text), dtype=str)
+    except:
+        st.error(f"Failed to load: {url}")
+        return pd.DataFrame()
 
 
-# -----------------------------
-# LOAD CITIES CSV (ZIP → Lat/Lng)
-# -----------------------------
+# -------------------------------------------------
+# LOAD CITY DATABASE
+# -------------------------------------------------
+city_df = load_csv(CITY_URL)
+if city_df.empty:
+    st.stop()
 
-@st.cache_data
-def load_city_zip_mapping():
-    url = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
-    df = pd.read_csv(url, encoding="utf-8-sig")
+city_df.columns = city_df.columns.str.lower().str.replace(" ", "_")
 
-    df.columns = [c.strip().lower() for c in df.columns]
+# Required columns: city, lat, lng, zips
+city_df["zips"] = city_df["zips"].fillna("")
 
-    if not {"city", "lat", "lng", "zips"}.issubset(df.columns):
-        st.error("City CSV missing required columns.")
-        st.stop()
+# CREATE ZIP → COORDINATE LOOKUP
+ZIP_COORDS = {}
 
-    zip_coords = {}
-    city_coords = {}
+for _, r in city_df.iterrows():
+    lat = float(r["lat"])
+    lng = float(r["lng"])
+    city_name = r["city"].title()
+    state = r["state_name"]
 
-    for _, row in df.iterrows():
-        city = str(row["city"]).strip().lower()
-        lat, lng = float(row["lat"]), float(row["lng"])
-        city_coords[city] = (lat, lng)
-
-        # Extract clean ZIP list
-        raw = str(row["zips"])
-        clean = re.sub(r"\s+", " ", raw)
-        zips = re.findall(r"\d{5}", clean)
-
-        for z in zips:
-            zip_coords[z] = {
-                "coords": (lat, lng),
-                "city": city.title()
-            }
-
-    return zip_coords, city_coords
+    for z in r["zips"].split():
+        ZIP_COORDS[z] = {
+            "coords": (lat, lng),
+            "city": city_name,
+            "state": state
+        }
 
 
-ZIP_COORDS, CITY_COORDS = load_city_zip_mapping()
+# -------------------------------------------------
+# LOAD JOB DATABASE
+# -------------------------------------------------
+jobs = load_csv(JOB_URL)
+if jobs.empty:
+    st.stop()
+
+jobs.columns = jobs.columns.str.lower().str.replace(" ", "_")
 
 
-# -----------------------------
-# LOCATION → COORDS FUNCTION
-# -----------------------------
+# -------------------------------------------------
+# FUNCTION: Get job coordinates
+# -------------------------------------------------
+def job_coordinates(row):
+    zip_code = str(row.get("zip_code", "")).strip()
 
-def get_coords(user_input):
-    """Convert user input into (lat, lng) without ZIP fuzzy matching."""
-    user_input = user_input.strip()
+    # ZIP MATCH
+    if ZIP_RE.search(zip_code):
+        z = ZIP_RE.search(zip_code).group(1)
+        if z in ZIP_COORDS:
+            return ZIP_COORDS[z]["coords"]
 
-    # ZIP?
-    m = ZIP_RE.search(user_input)
-    if m:
-        zip_code = m.group(0)
-        return ZIP_COORDS.get(zip_code, {}).get("coords")
+    # CITY MATCH
+    city = str(row.get("client_city", "")).strip().lower()
 
-    # City?
-    city_key = user_input.lower()
-    if city_key in CITY_COORDS:
-        return CITY_COORDS[city_key]
-
-    # Fuzzy match only for cities (not ZIP)
-    match = get_close_matches(city_key, CITY_COORDS.keys(), n=1, cutoff=0.8)
-    if match:
-        return CITY_COORDS[match[0]]
+    match = city_df[city_df["city"].str.lower() == city]
+    if not match.empty:
+        lat = float(match.iloc[0]["lat"])
+        lng = float(match.iloc[0]["lng"])
+        return (lat, lng)
 
     return None
 
 
-# -----------------------------
-# LOAD JOB CSV
-# -----------------------------
+# -------------------------------------------------
+# USER INPUT
+# -------------------------------------------------
+st.subheader("🔍 Search Jobs")
 
-@st.cache_data
-def load_jobs():
-    url = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
-    df = pd.read_csv(url, encoding="utf-8-sig")
+search_query = st.text_input("Enter ZIP or City (e.g., 60602 or Boston)")
+radius = st.slider("Radius (miles)", 5, 500, 50)
 
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    needed = ["client name", "client city", "state", "zip code"]
-    for col in needed:
-        if col not in df.columns:
-            st.error(f"Missing column in job CSV: {col}")
-            st.stop()
-
-    df["client city"] = df["client city"].fillna("").astype(str)
-    df["zip code"] = df["zip code"].fillna("").astype(str)
-
-    return df
+search_clicked = st.button("Find Jobs")
 
 
-jobs_df = load_jobs()
+# -------------------------------------------------
+# RUN SEARCH
+# -------------------------------------------------
+if search_clicked:
 
+    # --- Resolve user coordinates ---
+    user_coords = None
 
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
+    # ZIP input
+    m = ZIP_RE.search(search_query)
+    if m:
+        z = m.group(1)
+        if z in ZIP_COORDS:
+            user_coords = ZIP_COORDS[z]["coords"]
+            st.info(f"Matched ZIP {z} → **{ZIP_COORDS[z]['city']}, {ZIP_COORDS[z]['state']}**")
 
-st.title("🔥 Fixed Job Distance Finder (ZIP-safe)")
+    # CITY input
+    if not user_coords:
+        city = search_query.lower().strip()
+        match = city_df[city_df["city"].str.lower() == city]
+        if not match.empty:
+            user_coords = (float(match.iloc[0]["lat"]), float(match.iloc[0]["lng"]))
+            st.info(f"Matched city → **{match.iloc[0]['city']}, {match.iloc[0]['state_name']}**")
 
-user_query = st.text_input("Enter ZIP or City", "")
-
-if user_query.strip():
-    coords = get_coords(user_query)
-
-    if coords is None:
-        st.error("❌ Location not found. ZIP not in database or city not recognized.")
+    if not user_coords:
+        st.error("City or ZIP not found.")
         st.stop()
 
-    user_lat, user_lng = coords
-    st.success(f"Location matched → {coords}")
+    # --- Compute job coordinates ---
+    jobs["coords"] = jobs.apply(job_coordinates, axis=1)
+    jobs_valid = jobs.dropna(subset=["coords"]).copy()
 
-    all_results = []
-
-    for _, row in jobs_df.iterrows():
-        # Primary: try ZIP → coords
-        zip_code = str(row["zip code"]).strip()
-
-        job_coords = None
-        if re.fullmatch(r"\d{5}", zip_code) and zip_code in ZIP_COORDS:
-            job_coords = ZIP_COORDS[zip_code]["coords"]
-
-        # Secondary: use city name
-        if job_coords is None:
-            job_coords = get_coords(row["client city"])
-
-        if job_coords is None:
-            continue
-
-        d = haversine(user_lat, user_lng, job_coords[0], job_coords[1])
-        all_results.append((d, row))
-
-    if not all_results:
-        st.warning("No matching job locations found.")
+    if jobs_valid.empty:
+        st.error("No jobs contain valid location mapping.")
         st.stop()
 
-    all_results.sort(key=lambda x: x[0])
+    # --- Compute distance in miles ---
+    jobs_valid["distance"] = jobs_valid["coords"].apply(
+        lambda c: geodesic(user_coords, c).miles
+    )
 
-    st.subheader("📍 Closest Jobs")
+    nearby = jobs_valid[jobs_valid["distance"] <= radius]
+    nearby = nearby.sort_values("distance")
 
-    for dist, row in all_results[:50]:
-        st.write(
-            f"""
-            **{row['client name']}**  
-            📍 {row['client city']}  
-            🧭 Distance: `{dist:.1f} km`  
-            💬 Language: {row.get('language', '')}  
-            💰 Pay Rate: {row.get('pay rate', '')}  
-            👤 Gender: {row.get('gender', '')}  
-            📝 Notes: {row.get('order notes', '')}
-            """
-        )
-        
+    if nearby.empty:
+        st.warning("No jobs found within selected radius.")
+        st.stop()
+
+    st.success(f"Found {len(nearby)} job(s) within {radius} miles.")
+
+    # -------------------------------------------------
+    # SHOW RESULTS WITH EXPANDERS
+    # -------------------------------------------------
+    for _, r in nearby.iterrows():
+        dist = r["distance"]
+
+        with st.expander(f"🏥 {r['client_name']} — {r['client_city']} ({dist:.1f} miles)"):
+            st.markdown(f"""
+**📍 Location:** {r['client_city']}, {r['state']}  
+**🧭 Distance:** {dist:.1f} miles  
+**🗣 Language:** {r['language']}  
+**💰 Pay Rate:** {r['pay_rate']}  
+**👤 Gender:** {r['gender']}  
+**📝 Notes:** {r['order_notes']}  
+""")
+
