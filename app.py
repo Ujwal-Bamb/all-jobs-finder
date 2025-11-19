@@ -1,143 +1,245 @@
 import streamlit as st
 import pandas as pd
-import math
+import pydeck as pdk
 import re
+import requests
+import chardet
+from io import StringIO
+from math import radians, sin, cos, sqrt, atan2
+from difflib import get_close_matches
 
-# -----------------------------
-# Load CSV Files
-# -----------------------------
-@st.cache_data
-def load_data():
-    cities = pd.read_csv(
-        "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
-    )
-    jobs = pd.read_csv(
-        "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
-    )
-    return cities, jobs
+# ---------------------- Streamlit Setup ----------------------
+st.set_page_config(page_title="😊 Keep Smiling (USA)", layout="wide")
 
-cities_df, jobs_df = load_data()
-
-# -----------------------------
-# Build ZIP → Coordinates map
-# -----------------------------
-ZIP_COORDS = {}
-
-for _, row in cities_df.iterrows():
-    lat, lng = row["lat"], row["lng"]
-    zip_str = str(row["zips"])
-
-    if pd.isna(zip_str):
-        continue
-
-    # Extract ZIPs
-    zips = re.findall(r"\b\d{5}\b", zip_str)
-
-    for z in zips:
-        ZIP_COORDS[z] = {
-            "coords": (lat, lng),
-            "city": row["city_ascii"],
-            "state": row["state_id"],
-        }
-
-
-# -----------------------------
-# Haversine Distance
-# -----------------------------
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371
-    d_lat = math.radians(lat2 - lat1)
-    d_lon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(d_lat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(d_lon / 2) ** 2
-    )
-    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+# ---------------------- Custom CSS ---------------------------
+st.markdown("""
+<style>
+.stApp {
+    background: linear-gradient(135deg, #e0f2ff, #f5f7ff);
+    font-family: 'Segoe UI', sans-serif;
+}
+.job-card {
+    background: white;
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 10px;
+    margin-bottom: 10px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.06);
+}
+.job-title {
+    font-size: 18px;
+    font-weight: bold;
+    color: #1e3a8a;
+    margin-bottom: 8px;
+}
+.job-field {
+    font-size: 15px;
+    margin-bottom: 4px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# -----------------------------
-# Get coordinates from city name
-# -----------------------------
-def get_city_coords(city_name):
-    rows = cities_df[cities_df["city_ascii"].str.lower() == city_name.lower()]
-    if len(rows) == 0:
-        return None
-    row = rows.iloc[0]
-    return row["lat"], row["lng"]
+# ---------------------- Raw CSV URLs -------------------------
+CITIES_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
+JOBS_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
 
 
-# -----------------------------
-# Page UI
-# -----------------------------
-st.title("🔥 US Job Distance Finder (Fixed ZIP Resolver)")
+# ---------------------- CSV Loader ---------------------------
+def load_csv(url):
+    try:
+        r = requests.get(url, timeout=10)
+        raw = r.content
+        enc = chardet.detect(raw)['encoding'] or "utf-8"
+        text = raw.decode(enc, errors="replace")
+        return pd.read_csv(StringIO(text))
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
+        return pd.DataFrame()
 
-user_input = st.text_input("Enter ZIP or City")
 
-if user_input:
-    ZIP_RE = r"\b\d{5}\b"
-    zip_match = re.search(ZIP_RE, user_input)
+# ---------------------- Load Cities --------------------------
+@st.cache_data(ttl=3600)
+def load_city_data():
+    df = load_csv(CITIES_URL)
+    if df.empty:
+        return {}, {}
 
-    if zip_match:
-        # User entered ZIP
-        inp_zip = zip_match.group(0)
+    cities = {}
+    zip_coords = {}
 
-        if inp_zip in ZIP_COORDS:
-            user_lat, user_lng = ZIP_COORDS[inp_zip]["coords"]
-            st.success(f"Location matched → {ZIP_COORDS[inp_zip]['city']} ({user_lat}, {user_lng})")
-        else:
-            st.error("ZIP not found in city database.")
-            st.stop()
-    else:
-        # User entered city
-        coords = get_city_coords(user_input)
-        if coords is None:
-            st.error("City not found.")
-            st.stop()
-        user_lat, user_lng = coords
-        st.success(f"Location matched → {user_input} ({user_lat}, {user_lng})")
+    for _, row in df.iterrows():
+        try:
+            city = str(row["city"]).strip().lower()
+            lat = float(row["lat"])
+            lng = float(row["lng"])
+            cities[city] = (lat, lng)
 
-    # -----------------------------
-    # Compute Job Distances
-    # -----------------------------
-    results = []
-
-    for _, row in jobs_df.iterrows():
-        job_city = str(row["Client City"])
-        job_zip = str(row["Zip Code"])
-
-        # 1. Prefer ZIP if valid
-        job_coords = None
-        if re.fullmatch(r"\d{5}", job_zip) and job_zip in ZIP_COORDS:
-            job_coords = ZIP_COORDS[job_zip]["coords"]
-        else:
-            # 2. Try city-based
-            job_coords = get_city_coords(job_city)
-
-        if job_coords is None:
+            if pd.notna(row["zips"]):
+                for z in str(row["zips"]).split():
+                    zip_coords[z] = {"coords": (lat, lng), "city": city.title()}
+        except:
             continue
 
-        d = haversine(user_lat, user_lng, job_coords[0], job_coords[1])
-        results.append((d, row))
+    return cities, zip_coords
 
-    # Sort by distance
-    results.sort(key=lambda x: x[0])
 
-    # -----------------------------
-    # Display Results
-    # -----------------------------
-    st.subheader("📍 Closest Jobs")
+CITIES, ZIP_COORDS = load_city_data()
 
-    for dist, row in results[:50]:
-        st.markdown(f"""
-        ### **{row['Client Name']}**
-        **📍 City:** {row['Client City']}  
-        **🧭 Distance:** {dist:.1f} km  
-        **💬 Language:** {row['Language']}  
-        **💰 Pay Rate:** {row['Pay Rate']}  
-        **👤 Gender:** {row['Gender']}  
-        **📝 Notes:** {row['Order Notes']}  
-        ---
-        """)
 
+# ---------------------- Load Jobs ---------------------------
+@st.cache_data(ttl=1800)
+def load_jobs():
+    df = load_csv(JOBS_URL)
+    if df.empty:
+        return df
+
+    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_", regex=False)
+    return df
+
+
+jobs = load_jobs()
+
+
+# ---------------------- Text Parser -------------------------
+ZIP_RE = re.compile(r"\b(\d{5})\b")
+
+
+def resolve_coords(text):
+    """Returns (lat, lng) from ZIP or city."""
+    if not text:
+        return None
+
+    # Try ZIP first
+    m = ZIP_RE.search(text)
+    if m:
+        z = m.group(1)
+        if z in ZIP_COORDS:
+            return ZIP_COORDS[z]["coords"]
+
+    # Try city name
+    city = text.split(",")[0].strip().lower()
+    if city in CITIES:
+        return CITIES[city]
+
+    # Fuzzy fallback
+    m = get_close_matches(city, CITIES.keys(), n=1, cutoff=0.72)
+    if m:
+        return CITIES[m[0]]
+
+    return None
+
+
+# ---------------------- Haversine ---------------------------
+def distance_miles(c1, c2):
+    if not c1 or not c2:
+        return float("inf")
+    R = 3958.8
+    lat1, lon1 = map(radians, c1)
+    lat2, lon2 = map(radians, c2)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+# ---------------------- UI ---------------------------
+st.title("😊 Keep Smiling — USA Job Finder")
+st.write("Search caregiver job listings by city or ZIP across the USA.")
+
+if jobs.empty:
+    st.error("Job data could not be loaded.")
+    st.stop()
+
+# Detect location columns
+LOCATION_COL = "client_city"
+ZIP_COL = "zip_code"
+
+jobs[LOCATION_COL] = jobs[LOCATION_COL].astype(str).str.strip()
+jobs["location_norm"] = jobs[LOCATION_COL].str.lower()
+
+
+# Search Controls
+col1, col2, col3 = st.columns([2, 2, 1])
+
+with col1:
+    search_type = st.radio("Search by", ["City", "ZIP"], horizontal=True)
+
+with col2:
+    query = st.text_input("Enter City or ZIP")
+
+with col3:
+    radius = st.slider("Radius (miles)", 1, 300, 50)
+
+search = st.button("🔎 Find Jobs", use_container_width=True)
+
+
+# ---------------------- Search Action ------------------------
+if search:
+
+    # Resolve user coordinates
+    if search_type == "ZIP":
+        m = ZIP_RE.search(query)
+        if not m:
+            st.error("Please enter a valid 5-digit ZIP.")
+            st.stop()
+        z = m.group(1)
+        user_coords = ZIP_COORDS.get(z, {}).get("coords")
+    else:
+        user_coords = resolve_coords(query)
+
+    if not user_coords:
+        st.error("Location not found.")
+        st.stop()
+
+    # Build job coordinates
+    jobs["coords"] = jobs["location_norm"].apply(resolve_coords)
+    valid_jobs = jobs.dropna(subset=["coords"]).copy()
+
+    valid_jobs["distance"] = valid_jobs["coords"].apply(lambda c: distance_miles(user_coords, c))
+    nearby = valid_jobs[valid_jobs["distance"] <= radius].sort_values("distance")
+
+    if nearby.empty:
+        st.warning("No jobs found in that radius.")
+        st.stop()
+
+    st.success(f"Found {len(nearby)} job(s) near {query}!")
+
+    # ---------------------- Display Jobs ----------------------
+    for _, r in nearby.iterrows():
+        st.markdown(
+            f"""
+            <div class='job-card'>
+                <div class='job-title'>🏥 {r['client_name']}</div>
+                <div class='job-field'><b>📍 City:</b> {r['client_city']}</div>
+                <div class='job-field'><b>🧭 Distance:</b> {r['distance']:.1f} miles</div>
+                <div class='job-field'><b>💬 Language:</b> {r.get('language','N/A')}</div>
+                <div class='job-field'><b>💰 Pay Rate:</b> {r.get('pay_rate','N/A')}</div>
+                <div class='job-field'><b>👤 Gender:</b> {r.get('gender','N/A')}</div>
+                <div class='job-field'><b>📝 Notes:</b> {r.get('order_notes','N/A')}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # ---------------------- Map ----------------------
+    map_df = pd.DataFrame(
+        [{"lat": c[0], "lon": c[1]} for c in nearby["coords"].tolist()]
+    )
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_df,
+        get_position='[lon, lat]',
+        get_radius=600,
+        pickable=True,
+    )
+
+    view_state = pdk.ViewState(
+        latitude=user_coords[0],
+        longitude=user_coords[1],
+        zoom=6,
+    )
+
+    st.subheader("🗺️ Job Locations Map")
+    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state))
+    
