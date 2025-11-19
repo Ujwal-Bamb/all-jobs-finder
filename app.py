@@ -1,197 +1,138 @@
 import streamlit as st
 import pandas as pd
-import requests
-import chardet
-from io import StringIO
-from math import radians, sin, cos, sqrt, atan2
-import re
+from geopy.distance import geodesic
 
-# -------------------------
-# URLs for your CSV files
-# -------------------------
-CITIES_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
-JOBS_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
+st.title("🔥 Job Finder (Correct ZIP, City, State Matching)")
 
-ZIP_RE = re.compile(r"\b(\d{5})\b")
+# -----------------------------
+# Load Your Datasets
+# -----------------------------
+CITY_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job%20cities.csv"
+JOB_URL = "https://raw.githubusercontent.com/Ujwal-Bamb/all-jobs-finder/refs/heads/main/all%20job.csv"
 
+city_df = pd.read_csv(CITY_URL, dtype=str)
+job_df = pd.read_csv(JOB_URL, dtype=str)
 
-# -------------------------
-# Load CSV with encoding detection
-# -------------------------
-def read_csv_url(url):
-    r = requests.get(url, timeout=20)
-    raw = r.content
-    enc = chardet.detect(raw)['encoding'] or "utf-8"
-    return pd.read_csv(StringIO(raw.decode(enc, errors="replace")))
+# Convert latitude/longitude to float
+city_df["lat"] = city_df["lat"].astype(float)
+city_df["lng"] = city_df["lng"].astype(float)
+
+# Fix ZIP column to list of ZIP codes
+city_df["zip_list"] = city_df["zips"].fillna("").apply(lambda z: [x.strip() for x in z.split()])
 
 
-# -------------------------
-# Preload city + ZIP database
-# -------------------------
-@st.cache_data
-def load_city_database():
-    df = read_csv_url(CITIES_URL)
+# -----------------------------
+# Helpers
+# -----------------------------
+def find_location(user_input):
+    """Returns (lat, lng, city, state) for ZIP or city"""
+    
+    user_input = user_input.strip()
 
-    # Required columns:
-    # city, city_ascii, state_id, state_name, lat, lng, zips
-    df['city_ascii'] = df['city_ascii'].astype(str).str.strip()
-    df['state_id'] = df['state_id'].astype(str).str.strip()
-    df['state_name'] = df['state_name'].astype(str).str.strip()
+    # --- ZIP SEARCH ---
+    if user_input.isdigit():
+        row = city_df[city_df["zip_list"].apply(lambda z: user_input in z)]
+        if not row.empty:
+            r = row.iloc[0]
+            return r["lat"], r["lng"], r["city"], r["state_name"]
+    
+    # --- CITY SEARCH ---
+    city_only = user_input.lower()
+    state_from_user = None
 
-    city_state_lookup = {}
-    zip_lookup = {}
+    # If user enters "Hilliard, OH"
+    if "," in user_input:
+        parts = [x.strip() for x in user_input.split(",")]
+        city_only = parts[0].lower()
+        state_from_user = parts[1].lower()
 
-    for _, row in df.iterrows():
-        city = row['city_ascii'].strip().lower()
-        state_id = row['state_id'].strip().lower()
-        state_name = row['state_name'].strip().lower()
+    rows = city_df[city_df["city_ascii"].str.lower() == city_only]
 
-        lat = float(row['lat'])
-        lng = float(row['lng'])
+    # Filter by state if included
+    if state_from_user:
+        rows = rows[rows["state_id"].str.lower() == state_from_user]
 
-        # City lookup keys
-        city_state_lookup[(city, state_id)] = (lat, lng)
-        city_state_lookup[(city, state_name)] = (lat, lng)
+    if not rows.empty:
+        r = rows.iloc[0]
+        return r["lat"], r["lng"], r["city"], r["state_name"]
 
-        # ZIP lookup
-        zip_list = re.findall(r"\d{5}", str(row['zips']))
-        for z in zip_list:
-            zip_lookup[z] = (lat, lng)
-
-    return city_state_lookup, zip_lookup
-
-
-city_state_lookup, zip_lookup = load_city_database()
-
-
-# -------------------------
-# Load job file
-# -------------------------
-@st.cache_data
-def load_jobs():
-    df = read_csv_url(JOBS_URL)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    df = df.fillna("")
-    return df
+    return None
 
 
-jobs_df = load_jobs()
-
-
-# -------------------------
-# Distance calculation
-# -------------------------
-def haversine(coords1, coords2):
-    lat1, lon1 = coords1
-    lat2, lon2 = coords2
-    R = 3958.8  # miles
-
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-
-    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
-
-
-# -------------------------
-# Resolve user input → coordinates
-# -------------------------
-def resolve_user_location(text):
-    text = text.strip()
-
-    # If ZIP
-    if text.isdigit():
-        if text in zip_lookup:
-            return zip_lookup[text]
+def get_city_coords(city_name, state_name):
+    """Gets job city coordinates from city_df"""
+    rows = city_df[
+        (city_df["city_ascii"].str.lower() == str(city_name).lower()) &
+        (city_df["state_name"].str.lower() == str(state_name).lower())
+    ]
+    if rows.empty:
         return None
-
-    # If "City, State"
-    if "," in text:
-        city, state = [p.strip().lower() for p in text.split(",", 1)]
-        key = (city, state)
-        return city_state_lookup.get(key)
-
-    # City only
-    city_lower = text.lower()
-    for (c, s), coords in city_state_lookup.items():
-        if c == city_lower:
-            return coords
-
-    return None
+    r = rows.iloc[0]
+    return (r["lat"], r["lng"])
 
 
-# -------------------------
-# Resolve job row → coordinates
-# -------------------------
-def job_coordinates(row):
-    # Try ZIP first
-    zip_code = row["zip_code"]
-    m = ZIP_RE.search(zip_code)
-    if m:
-        z = m.group(1)
-        if z in zip_lookup:
-            return zip_lookup[z]
-
-    # Then try city + state
-    city = row["client_city"].strip().lower()
-    state = row["state"].strip().lower()
-
-    # Try both forms (OH or Ohio)
-    for key in [(city, state)]:
-        if key in city_state_lookup:
-            return city_state_lookup[key]
-
-    return None
-
-
-# -------------------------
+# -----------------------------
 # Streamlit UI
-# -------------------------
-st.title("Job Finder (Correct ZIP & State Matching)")
+# -----------------------------
+st.subheader("Enter ZIP or City (Example: 60602 or Hilliard, OH)")
 
-query = st.text_input("Enter ZIP or City (e.g., 60602 or Hilliard, OH)", "")
+user_input = st.text_input("ZIP or City")
 radius = st.slider("Radius (miles)", 5, 500, 50)
 
-if st.button("Search"):
-    if not query:
-        st.warning("Enter a location.")
-        st.stop()
+if user_input:
+    result = find_location(user_input)
 
-    user_coords = resolve_user_location(query)
-    if not user_coords:
-        st.error("Location not found.")
-        st.stop()
-
-    st.success(f"Location matched at: {user_coords}")
-
-    # Compute all job coords
-    jobs = jobs_df.copy()
-    jobs["coords"] = jobs.apply(job_coordinates, axis=1)
-    jobs = jobs[jobs["coords"].notna()].copy()
-
-    # Distance
-    jobs["distance"] = jobs["coords"].apply(lambda c: haversine(user_coords, c))
-
-    # Filter
-    nearby = jobs[jobs["distance"] <= radius].sort_values("distance")
-
-    if nearby.empty:
-        st.warning("No jobs found in that radius.")
-        st.stop()
-
-    st.success(f"Found {len(nearby)} jobs")
-
-    for _, r in nearby.iterrows():
-        st.markdown(
-            f"""
-            ### 🏥 {r['client_name']}
-            **📍 Location:** {r['client_city']}, {r['state']}  
-            **🧭 Distance:** {r['distance']:.1f} miles  
-            **💬 Language:** {r['language']}  
-            **💰 Pay Rate:** {r['pay_rate']}  
-            **👤 Gender:** {r['gender']}  
-            **📝 Notes:** {r['order_notes']}  
-            ---
-            """
-        )
+    if not result:
+        st.error("❌ No matching ZIP/City found. Try a valid US ZIP or city name.")
+    else:
+        user_lat, user_lng, user_city, user_state = result
         
+        st.success(f"📌 Location matched at: ({user_lat}, {user_lng}) — {user_city}, {user_state}")
+
+        # -----------------------------
+        # MATCH JOBS
+        # -----------------------------
+        job_results = []
+
+        for _, job in job_df.iterrows():
+            job_city = job.get("Client City", "")
+            job_state = job.get("State", "")
+
+            coords = get_city_coords(job_city, job_state)
+            if not coords:
+                continue
+
+            job_lat, job_lng = coords
+            dist = geodesic((user_lat, user_lng), (job_lat, job_lng)).miles
+
+            if dist <= radius:
+                job_results.append({
+                    "client": job.get("Client Name", "Unknown"),
+                    "city": job_city,
+                    "state": job_state,
+                    "distance": round(dist, 1),
+                    "pay": job.get("Pay Rate", "N/A"),
+                    "gender": job.get("Gender", "N/A"),
+                    "language": job.get("Language", "N/A"),
+                    "notes": job.get("Order Notes", "N/A")
+                })
+
+        # -----------------------------
+        # OUTPUT
+        # -----------------------------
+        if not job_results:
+            st.warning("No jobs found within selected radius.")
+        else:
+            st.subheader("📍 Closest Jobs Found:")
+
+            for j in sorted(job_results, key=lambda x: x["distance"]):
+                st.markdown(f"""
+                **{j['client']}**
+                - 📍 **{j['city']}, {j['state']}**
+                - 🧭 Distance: **{j['distance']} miles**
+                - 💬 Language: **{j['language']}**
+                - 💰 Pay Rate: **{j['pay']}**
+                - 👤 Gender: **{j['gender']}**
+                - 📝 Notes: {j['notes']}
+                """)
+
