@@ -102,16 +102,24 @@ def job_coordinates(row):
 # -------------------------------------------------
 st.subheader("🔍 Search Jobs")
 
-search_query = st.text_input("Enter ZIP or City (e.g., 60602 or Boston)")
+# store search query into Streamlit session state
+search_query = st.text_input(
+    "Enter ZIP or City (e.g., 60602 or Boston)",
+    key="query",
+    on_change=lambda: st.session_state.__setitem__("run", True)
+)
+
 radius = st.slider("Radius (miles)", 5, 500, 50)
 
-search_clicked = st.button("Find Jobs")
+# run automatically when user presses Enter
+search_clicked = st.session_state.get("run", False)
+
 
 
 # -------------------------------------------------
 # RUN SEARCH
 # -------------------------------------------------
-if search_clicked:
+if search_clicked and search_query:
 
     # --- Resolve user coordinates ---
     user_coords = None
