@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import datetime
-from io import StringIO
+from io import StringIO, BytesIO
 from typing import TypedDict, List, Dict, Any
 
 import pandas as pd
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 
 try:
-    import fitz
+    import pymupdf as fitz
 except ImportError:
     fitz = None
 
@@ -39,12 +39,33 @@ if hasattr(st, "secrets"):
 
 def to_csv_url(url: str) -> str:
     url = url.strip()
-    if "docs.google.com/spreadsheets/d/" in url and "/export" not in url:
+    if "docs.google.com/spreadsheets/d/" in url and "/export" not in url and "/pub" not in url:
         sheet_id = url.split("/d/")[1].split("/")[0]
         m = re.search(r"gid=(\d+)", url)
         gid = m.group(1) if m else "0"
         return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     return url
+
+
+def fetch_sheet_safely(url: str) -> pd.DataFrame:
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    raw_bytes = resp.content
+
+    # If the link points to an .xlsx file, read the first sheet directly
+    if raw_bytes[:2] == b"PK":
+        xls = pd.ExcelFile(BytesIO(raw_bytes))
+        return pd.read_excel(xls, sheet_name=xls.sheet_names[0], dtype=str)
+
+    text = resp.text.lstrip("\ufeff")
+    if text.lstrip().startswith(("<!DOCTYPE html", "<html")):
+        raise ValueError("Google Sheet link returned HTML instead of CSV. Use Publish to web -> CSV.")
+
+    try:
+        return pd.read_csv(StringIO(text), dtype=str)
+    except Exception:
+        # Fallback for messy live rows with unquoted commas or line breaks
+        return pd.read_csv(StringIO(text), dtype=str, engine="python", on_bad_lines="skip")
 
 
 def get_roles(notes: str, pay: str = "", client: str = "") -> List[str]:
@@ -78,7 +99,7 @@ def match_language(cand_langs: List[str], rule: Dict[str, Any]) -> bool:
     return True
 
 
-@st.cache_data(ttl=86400)  # Cached once per day (24h) / end-of-day cycle
+@st.cache_data(ttl=86400)  # Cached once per day (end-of-day sync)
 def load_data(sheet_url: str = "", day_key: str = ""):
     _ = day_key
     city_df = pd.read_csv(StringIO(requests.get(CITY_URL, timeout=15).text), dtype=str).fillna("")
@@ -95,15 +116,23 @@ def load_data(sheet_url: str = "", day_key: str = ""):
             zip_map[z] = coords
 
     clean_url = to_csv_url(sheet_url)
+    jobs_df = None
+    source = ""
+
     if clean_url:
-        jobs_df = pd.read_csv(StringIO(requests.get(clean_url, timeout=15).text), dtype=str)
-        source = "Live Google Sheet (Daily Sync)"
-    elif os.path.exists(LOCAL_JOB_FILE):
-        jobs_df = pd.read_csv(LOCAL_JOB_FILE, dtype=str)
-        source = "Local CSV"
-    else:
-        jobs_df = pd.read_csv(StringIO(requests.get(JOB_URL, timeout=15).text), dtype=str)
-        source = "GitHub CSV"
+        try:
+            jobs_df = fetch_sheet_safely(clean_url)
+            source = "Live Google Sheet (Daily Sync)"
+        except Exception as exc:
+            st.warning(f"Live sheet link could not be parsed ({exc}); falling back to backup CSV.")
+
+    if jobs_df is None:
+        if os.path.exists(LOCAL_JOB_FILE):
+            jobs_df = pd.read_csv(LOCAL_JOB_FILE, dtype=str)
+            source = "Local CSV Backup"
+        else:
+            jobs_df = pd.read_csv(StringIO(requests.get(JOB_URL, timeout=15).text), dtype=str)
+            source = "GitHub CSV Backup"
 
     jobs_df = jobs_df.fillna("")
     jobs_df.columns = jobs_df.columns.str.lower().str.strip().str.replace(" ", "_")
@@ -129,13 +158,16 @@ class ExtractedIntent(BaseModel):
     languages: List[str] = Field(default_factory=lambda: ["English"])
     roles: List[str] = Field(default_factory=list, description="CAREGIVER, HHA, CNA, STNA, PCA")
 
+
 class JobScore(BaseModel):
     job_idx: int
     score: int = Field(ge=0, le=100)
     pitch: str = Field(description="2-sentence call pitch")
 
+
 class BatchScores(BaseModel):
     items: List[JobScore]
+
 
 class AgentState(TypedDict):
     call_notes: str
