@@ -10,7 +10,7 @@ from geopy.distance import geodesic
 # -------------------------------------------------
 st.set_page_config(page_title="USA Job Finder", layout="wide")
 
-st.title("🇺🇸 USA Job Finder")
+st.title("USA Job Finder")
 st.write("Search caregiver jobs by ZIP code or City. Distance shown in **miles**.")
 
 # -------------------------------------------------
