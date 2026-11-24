@@ -1,9 +1,11 @@
-import streamlit as st
-import pandas as pd
-import requests
 import re
 from io import StringIO
+
 from geopy.distance import geodesic
+import pandas as pd
+import pydeck as pdk
+import requests
+import streamlit as st
 
 # -------------------------------------------------
 # APP SETTINGS
@@ -29,7 +31,7 @@ def load_csv(url):
     try:
         text = requests.get(url).text
         return pd.read_csv(StringIO(text), dtype=str)
-    except:
+    except Exception:
         st.error(f"Failed to load: {url}")
         return pd.DataFrame()
 
@@ -59,7 +61,7 @@ for _, r in city_df.iterrows():
         ZIP_COORDS[z] = {
             "coords": (lat, lng),
             "city": city_name,
-            "state": state
+            "state": state,
         }
 
 
@@ -121,7 +123,9 @@ if search_clicked and search_query:
         z = m.group(1)
         if z in ZIP_COORDS:
             user_coords = ZIP_COORDS[z]["coords"]
-            st.info(f"Matched ZIP {z} → **{ZIP_COORDS[z]['city']}, {ZIP_COORDS[z]['state']}**")
+            st.info(
+                f"Matched ZIP {z} → **{ZIP_COORDS[z]['city']}, {ZIP_COORDS[z]['state']}**"
+            )
 
     # CITY input
     if not user_coords:
@@ -129,7 +133,9 @@ if search_clicked and search_query:
         match = city_df[city_df["city"].str.lower() == city]
         if not match.empty:
             user_coords = (float(match.iloc[0]["lat"]), float(match.iloc[0]["lng"]))
-            st.info(f"Matched city → **{match.iloc[0]['city']}, {match.iloc[0]['state_name']}**")
+            st.info(
+                f"Matched city → **{match.iloc[0]['city']}, {match.iloc[0]['state_name']}**"
+            )
 
     if not user_coords:
         st.error("City or ZIP not found.")
@@ -158,13 +164,47 @@ if search_clicked and search_query:
     st.success(f"Found {len(nearby)} job(s) within {radius} miles.")
 
     # -------------------------------------------------
-    # SHOW MAP OF MATCHING JOBS
+    # SHOW MAP OF MATCHING JOBS & CANDIDATE LOCATION
     # -------------------------------------------------
-    map_df = pd.DataFrame({
-        "lat": [c[0] for c in nearby["coords"]] + [user_coords[0]],
-        "lon": [c[1] for c in nearby["coords"]] + [user_coords[1]],
-    })
-    st.map(map_df)
+    map_rows = [
+        {
+            "lat": c[0],
+            "lon": c[1],
+            "label": "Job",
+            "color": [220, 38, 38, 200],
+        }
+        for c in nearby["coords"]
+    ]
+    map_rows.append(
+        {
+            "lat": user_coords[0],
+            "lon": user_coords[1],
+            "label": "Candidate",
+            "color": [37, 99, 235, 240],
+        }
+    )
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_rows,
+        get_position="[lon, lat]",
+        get_color="color",
+        get_radius=1200,
+        pickable=True,
+    )
+    view_state = pdk.ViewState(
+        latitude=user_coords[0],
+        longitude=user_coords[1],
+        zoom=8,
+    )
+    st.caption("Blue pin = Candidate location | Red pins = Matching jobs")
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[layer],
+            initial_view_state=view_state,
+            tooltip={"text": "{label}"},
+        )
+    )
 
     # -------------------------------------------------
     # SHOW RESULTS WITH EXPANDERS
@@ -172,12 +212,16 @@ if search_clicked and search_query:
     for _, r in nearby.iterrows():
         dist = r["distance"]
 
-        with st.expander(f"🏥 {r['client_name']} — {r['client_city']} ({dist:.1f} miles)"):
-            st.markdown(f"""
+        with st.expander(
+            f"🏥 {r['client_name']} — {r['client_city']} ({dist:.1f} miles)"
+        ):
+            st.markdown(
+                f"""
 **📍 Location:** {r['client_city']}, {r['state']}  
 **🧭 Distance:** {dist:.1f} miles  
 **🗣 Language:** {r['language']}  
 **💰 Pay Rate:** {r['pay_rate']}  
 **👤 Gender:** {r['gender']}  
 **📝 Notes:** {r['order_notes']}  
-""")
+"""
+            )
