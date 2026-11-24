@@ -158,6 +158,15 @@ if search_clicked and search_query:
     st.success(f"Found {len(nearby)} job(s) within {radius} miles.")
 
     # -------------------------------------------------
+    # SHOW MAP OF MATCHING JOBS
+    # -------------------------------------------------
+    map_df = pd.DataFrame({
+        "lat": [c[0] for c in nearby["coords"]] + [user_coords[0]],
+        "lon": [c[1] for c in nearby["coords"]] + [user_coords[1]],
+    })
+    st.map(map_df)
+
+    # -------------------------------------------------
     # SHOW RESULTS WITH EXPANDERS
     # -------------------------------------------------
     for _, r in nearby.iterrows():
@@ -172,4 +181,3 @@ if search_clicked and search_query:
 **👤 Gender:** {r['gender']}  
 **📝 Notes:** {r['order_notes']}  
 """)
-
